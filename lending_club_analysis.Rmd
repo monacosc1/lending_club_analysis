@@ -1,0 +1,585 @@
+---
+title: "Lending Club Analysis"
+author: "Scott Monaco"
+date: "1/22/2022"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  html_document:
+    code_folding: show
+    highlight: haddock
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, fig.height = 4)
+if(!require("pacman")) install.packages("pacman")
+pacman::p_load(data.table, ggplot2, dplyr, tidyr, bestglm, glmnet, tidyverse, 
+               car, reshape2, GGally, pROC, gglasso, randomForest, tree, 
+               rpart, rattle, partykit, lda, tree)
+```
+
+```{r echo=FALSE}
+# load data
+loan <- fread("loanStats_07_11_clean.csv", stringsAsFactors = T)
+loan_full <- read.csv("LoanStats_07_11_Full.csv")
+```
+
+
+\pagebreak
+
+# Executive Summary
+
+Lending Club is an online peer-to-peer platform that connects individual borrowers with individual investors. The compnay is the largest such platform that provides an important source of liquidity in a market where institutional investors have historically neglected. As of September 30, 2019, Lending Club has originated over $53 billion in total loan issuance.
+
+However, as more borrowers sign on to the platform, the supply of loans plays a role in the evolving underwriting standards, which can impact investor results based on how loans perform. As a result, it is increasingly important to understand what factors are most associated with creditworthiness. 
+
+
+## Goal of the Analysis
+
+The goal of this analysis is to identify a set of important features that will predict loan status, which we classify as "good" for a loan that is fully paid off and "bad" for a loan that is charged off. Our analysis uses data from the period between 2007-2011 for which we have 38,971 observations and 38 attributes. We have developed four categories of models to predict loan status, which are:
+
+- Logistic Regression based model (Backwards Selection)
+- LASSO model
+- Elastic Net model
+- Random Forest model
+
+## Main Findings
+
+The final analysis reveals that significant predictive power exists among variables given in the data. In particular, term, interest rate, the ratio of monthly debt obligations to self reported income (dti), revolving line utilization rates, the number of credit inquiries in the past 6 months, the number of derogatory public records, and the number of bankruptcies have a negative association with the response variable of loan status = fully paid off. That is to say, the greater numbers or percentages of these variables correspond to a lower chance of a loan being fully paid off. Conversely, annual income is positively associated with the response variable. That is, the greater the annual income, the greater chance of fully paying off the loan. 
+
+\pagebreak
+
+# Data Summary and Exploration
+
+## Data Overview
+
+The dataset on the loans includes attributes such as loan amount, home ownership status, interest rate, loan status and grade of the loan among many others. Of the 38 predictors, 15 of them are categorical in nature (see **Exhibit 1**). The response variable for the analysis is loan status, which is a two-level response variable. Of the 38,971 observations in the data set, 33503 have loan status fully paid off (86%), while the remaining 14% of the data are charged off. Below is a graphical summary of loan status by loan amount, which shows significant overlap in the size of the loan and whether they were paid off or not.
+
+```{r, results = TRUE, echo = FALSE}
+ggplot(loan) + geom_boxplot(aes(x = loan_status, y = loan_amnt))
+```
+
+## Quantitative and Graphical Summaries
+
+To get a better understanding of the predictor variables we are working with in this analysis, we looked at a correlation table of the numerical variables to understand where there may be some collinearity.
+
+```{r, results = TRUE, echo = FALSE}
+cor.mat3 <- loan %>% select_if(is.numeric) %>% select(loan_amnt, int_rate, dti, revol_util, installment, pub_rec, pub_rec_bankruptcies) %>% cor
+cor.mat3
+```
+
+Here, we can see that installment and loan amount are highly correlated, which makes sense since one is a derivation of the other. Also the number of derogatory public records is highly correlated with the number of public record bankruptcies. This information will be useful in model building later.
+
+With this correlation matrix helping us understand key summaries and relationships of numerical variables, we know look at similar graphical summaries of potentially important categorical variables. 
+
+```{r eval = TRUE, echo = FALSE}
+loan %>%
+  group_by(term, grade, home_ownership, loan_status) %>%
+  summarise(LS_number = n()) %>%
+  ggplot(aes(x = home_ownership, y = LS_number, fill = loan_status)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_grid(term~grade, scales = "free_y") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  ggtitle("Loans fully paid off by term across grade and home ownership")
+```
+
+The above graph provides a breakdown of loan status by term across grade and homeownership. First, it appears that the higher the grade (i.e. A, B, C), the greater number of loans paid off. Second, loans that have a term of 36 months show greater frequency of fully paid loans. Finally, mortgage and rent show associations with fully paid loans at the higher grade levels. This association weakens as the grade lowers, and more charged off loans appear among both mortgage owners and renters. 
+
+The last part of the data exploration involves a summary of the association between geographic features (i.e. state) and other predictors. We saved a heatmap for **Exhibit 2** that shows which states have the highest average loan amounts. Below is a breakdown of the worst performing states by % defaulted: 
+
+```{r eval = TRUE, echo = FALSE}
+state.data <- loan %>%
+group_by(addr_state) %>%
+  summarise(
+    defaulted = table(loan_status)[1],
+    fully_paid = table(loan_status)[2],
+    n = n()
+  )
+
+state.data1 <- state.data %>% mutate(percentage = defaulted / (defaulted + fully_paid))
+
+state.ordered <- state.data1[order(state.data1$percentage, decreasing = TRUE), c(1,4, 5)]
+head(state.ordered,5)
+```
+
+
+## Problems with the Data & Data Cleaning
+
+First, we note there is no missing data. However, the data does need to be cleaned. The levels of verification status were duplicated so we merged the data into two levels. Second, states and earliest credit line had categories with too few observations in it, therefore we grouped observations among many categories into one bin. Third, we decided to remove highly correlated variables from our consideration, such as grade since grade and sub grade are collinear. Fourth, we had to remove the variables related to post loan data because they are not useful in predicting the quality of loans before they are issued. Finally, we split the dataset into three sets. The training data set (50%) that will be used to train our models. The testing data set (25%) that will be used for model selection. The validation data set (25%) that will be used to summarize the final model.
+
+## Variables Considered as Input
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+#First, combine verification status column
+loan1 <- mutate(loan, verification.status = if_else(verification_status == "Verified" | verification_status == "Source Verified", "Verified", "Not Verified")) %>% drop_na() 
+
+#Second, combine states that have very few observations into "Other". Less than 100
+loan2 <- mutate(loan1, state = if_else(addr_state == "IA" | addr_state == "ID" | addr_state == "IN" | addr_state == "NE" | addr_state == "MS" | addr_state == "AK" | addr_state == "MT" | addr_state == "SD" | addr_state == "TN" | addr_state == "VT" | addr_state == "WY", "Other", as.character(loan1$addr_state))) %>% drop_na()
+
+#Next, separate out earliest credit line by month and year. Then combine years pre-1980.
+loan3 <- loan2 %>%
+            separate(earliest_cr_line,sep=" ", into = c("earliest_cr_line_month", "earliest_cr_line_year"))
+
+#Because there are 526 levels, we need to group up all the months into a single year. and then group all years credit history from before 1980 into one category called "pre-1980". This is reasonable since the difference between a 35 year and 55 year credit is negligible. 
+loan4 <- mutate(loan3, earliest.cr.line.year = if_else(earliest_cr_line_year == "1946" | earliest_cr_line_year == "1950" | earliest_cr_line_year == "1954" | earliest_cr_line_year == "1956" | earliest_cr_line_year == "1959" | earliest_cr_line_year == "1961" | earliest_cr_line_year == "1962" | earliest_cr_line_year == "1963" | earliest_cr_line_year == "1964" | earliest_cr_line_year == "1965" | earliest_cr_line_year == "1966" | earliest_cr_line_year == "1967" | earliest_cr_line_year == "1968" | earliest_cr_line_year == "1969" | earliest_cr_line_year == "1970" | earliest_cr_line_year == "1971" | earliest_cr_line_year == "1972" | earliest_cr_line_year == "1973" | earliest_cr_line_year == "1974" | earliest_cr_line_year == "1975" | earliest_cr_line_year == "1976" | earliest_cr_line_year == "1977" | earliest_cr_line_year == "1978" | earliest_cr_line_year == "1979", "Pre-1980", as.character(loan3$earliest_cr_line_year))) %>% drop_na()
+
+# Remove variables that are not necessary, too varied, or have too many levels
+length(levels(loan4$emp_title)) #28303 titles. too varied. remove.
+length(levels(loan4$zip_code)) #810 zip codes. too many levels.
+
+# var_to_exclude <- names(loan4) %in% c("emp_title", "verification_status", "zip_code", "addr_state", "earliest_cr_line_month", "earliest_cr_line_year")
+# loan4.1 <- loan4[!var_to_exclude]  # subset
+var_to_exclude <- c("emp_title", "verification_status", "zip_code", "addr_state", "earliest_cr_line_month", "earliest_cr_line_year")
+# loan4.1 <- loan4[,!names(loan4) %in% var_to_exclude]
+loan4.1 <- loan4 %>% select(-all_of(var_to_exclude))
+
+# Convert to factors
+loan4.1$verification.status <- as.factor(loan4.1$verification.status)
+loan4.1$state <- as.factor(loan4.1$state)
+loan4.1$earliest.cr.line.year <- as.factor(loan4.1$earliest.cr.line.year)
+```
+
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+# Split into three separate data sets
+
+set.seed(10)
+# Split the data:
+N <- length(loan4.1$loan_status)
+
+spec <- c(train = .5, test = .25, validate = .25)
+g <- sample(cut(
+      seq(N),
+      N*cumsum(c(0,spec)),
+      labels = names(spec)
+      ))
+
+res.1 <- split(loan4.1, g)
+
+loan.train.F <- res.1$train
+loan.test.F <- res.1$test
+loan.validation.F <- res.1$validate
+
+```
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+# Remove variables corresponding to post loan data, excluding our response (loan_status). 
+# Remove grade, since subset of sub_grade. Perfectly collinear
+
+var_to_exclude_2 <- c("issue_d", "funded_amnt", "funded_amnt_inv", "total_pymnt", "total_pymnt_inv", "total_rec_prncp", "total_rec_int", "total_rec_late_fee", "recoveries", "collection_recovery_fee", "last_pymnt_d", "last_pymnt_amnt", "last_credit_pull_d", "grade")
+
+loan.train.Final <- loan.train.F %>% select(-all_of(var_to_exclude_2))
+loan.test.Final <- loan.test.F %>% select(-all_of(var_to_exclude_2))
+loan.validation.Final <- loan.validation.F %>% select(-all_of(var_to_exclude_2))
+
+# For tree based models, we have to remove variables that have greater than 32 levels. Therefore, we remove sub_grade, state, earliest credit line and purpose
+var_to_exclude_3 <- c("sub_grade", "state", "earliest.cr.line.year", "purpose")
+loan.train.Final.tree <- loan.train.Final %>% select(-all_of(var_to_exclude_3))
+loan.test.Final.tree <- loan.test.Final %>% select(-all_of(var_to_exclude_3))
+
+```
+
+After cleaning the data in accordance with the previous section, we have the following variables under consideration as input for our model building 
+
+```{r eval = TRUE, echo = FALSE}
+names(loan.train.Final)
+```
+
+\pagebreak
+
+# Identify Important Risk Factors
+
+Before we build our models for our predictive analysis, we will examine a tree model based on minimum deviance (cp) to identify risk factors. 
+
+## Tree-based model
+
+To identify risk factors that a loan will be defaulted from a tree based model, we used an r partition with minimum cp = .00078 that contains all of the variables under consideration. This effectively creates a tree based on minimum deviance that will help us identify important variables for predicting loan status and possible interactions to consider. 
+
+
+```{r, eval = TRUE, echo = FALSE}
+# Using Tree to identify Risk Factors
+fit.tree.all.rpart2 <- rpart(loan_status ~ ., loan.train.Final.tree, minsplit = 125, cp = .0003)  #55, .0003; #37, .00078
+fit.tree.all.rpart2
+
+plot(fit.tree.all.rpart2)
+text(fit.tree.all.rpart2, pretty = TRUE)
+
+plot(as.party(fit.tree.all.rpart2), main="Final Tree")
+```
+
+Based on the tree output, interest rate is determined to be the key first split. Interest rates are negatively associated with the probability of paying off a loan. That is, the lower the interest rate, the greater chance the loan will be paid off. Another factor that is negative associated with a fully paid loan status is term. The lower the term, the greater chance of paying off a loan. Annual income shows a positive association with the response. In particular the tree diagram shows that incomes over ~$77000 have a higher chance of paying off a loan.
+
+\pagebreak
+
+# Model Build and Evaluation
+
+In building models for our analysis, we want to consider a range of options, including general linear models, lasso equations with different lambdas, elastic net models, and random forests with different mtry.
+
+## Model Building (10 models under consideration)
+
+As a start, we explore logistic regression as a basic analytical approach to predicting loan status. Our methodology explores different ways to develop a range of models
+
+* **Model 1**: Logistic regression model, using backwards selection to hone in on significant predictors based on p-value 0.05.
+
+Our first model under consideration was arrived by eliminating, one-by-one, the highest p-value predictor based on the Anova output. **Exhibit 3** shows the final Anova output and summary of the model.
+
+* **Model 2**: Relaxed LASSO model corresponding to lambda = lambda min
+
+Our second model is the model obtained from a LASSO, but relaxed to fit a glm model. This corresponds to the same variables as a LASSO model, but due to the shrinkage of LASSO estimates, the coefficient estimators for model 2 should be slightly larger than those for traditional LASSO (see **Exhibit 4**).
+
+* **Model 3**: Relaxed LASSO model corresponding to lambda = lambda first
+
+Our third model is the model obtained from the LASSO with lambda first, but relaxed to fit a glm model. This corresponds to the same variables as traditional LASSO, but due to the shrinkage of LASSO estimates, the coefficient estimators for model 3 should be slightly larger than those a typical LASSO using lambda first (see **Exhibit 5**).
+
+* **Model 4**: "Kitchen sink" model, using backwards selection and interaction terms
+
+Our fourth model takes the first model as a base model and considers the impact of interactions. The first significant interaction included was the one employment length and annual income. This interaction shows that the impact of employment length on loan status depends on annual income. In particular, the higher the annual income, the lower probability of paying off a loan for those borrowers who are employed at the company for 2 or more years. The second significant interaction included was the one between interest rate and revolving line utilization rate. The impact of interest rate on loan status depends on revolving line utilization rate. As the utilization rate increases, then the slope of the interest rate variable increases, which means the probability that a loan gets fully paid increases (see **Exhibit 6**).
+
+* **Model 5**: Best General Linear Model (Bestglm) with smallest AIC
+
+Our fifth model was built using the bestglm methodology with the smallest AIC as the model selection criterion and nvmax = 15. Furthermore, this model was built using an exhaustive method. Once the variables were identified from this model, we then fit the variables into a glm fit, as shown in **Exhibit 7** (i.e. relaxed).
+
+* **Model 6**: Parsimonious Model
+
+Model 6 was chosen to be the parsimonious model in the group. It was selected based on the relaxed fit of the best glm arrived at by model 5, and then shrunken down to eliminate all variables, one-by-one via backwards selections, that have p-value greater than 0.05 according to the Anova output (see **Exhibit 8**).
+
+* **Model 7**: Random Forest
+
+Our seventh and final model was a random forest arrived at by using mtry = 4 (rounded down from square root of 18 predictors) and ntree = 250 (see **Exhibit 9**). 
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+# Exhibit 3 (Model 1: Logistic Regression)
+
+# model1.10 <- glm(loan_status ~ ., data=loan.train.Final, family=binomial(logit))
+# Anova(model1.10)
+# 
+# model1.20 <- update(model1.10, .~. -installment)
+# Anova(model1.20)
+# 
+# model1.30 <- update(model1.20, .~. -delinq_2yrs)
+# Anova(model1.30)
+# 
+# model1.40 <- update(model1.30, .~. -verification.status)
+# Anova(model1.40)
+# 
+# model1.50 <- update(model1.40, .~. -pub_rec_bankruptcies)
+# Anova(model1.50)
+# 
+# model1.60 <- update(model1.50, .~. -total_acc)
+# Anova(model1.60)
+# 
+# model1.70 <- update(model1.60, .~. -open_acc)
+# Anova(model1.70)
+# 
+# model1.80 <- update(model1.70, .~. -loan_amnt)
+# Anova(model1.80)
+# 
+# model1.90 <- update(model1.80, .~. -revol_bal)
+# Anova(model1.90)
+
+model1 <- glm(loan_status ~ term + int_rate + sub_grade + emp_length + annual_inc + purpose + dti + inq_last_6mths + pub_rec + revol_util + state + earliest.cr.line.year, data=loan.train.Final, family=binomial(logit))
+# Anova(model1)
+
+```
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+# Exhibit 4 (Model 2: Relaxed LASSO, for lambda min, type deviance)
+model2 <- glm(loan_status ~ term + int_rate + sub_grade + emp_length + home_ownership + annual_inc + purpose + dti + inq_last_6mths + pub_rec + revol_util + pub_rec_bankruptcies + state + earliest.cr.line.year, data=loan.train.Final, family=binomial(logit))
+# Anova(model2)
+
+```
+
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+# Exhibit 5 (Model 3: Relaxed LASSO, lambda first, type deviance)
+model3 <- glm(loan_status ~ term + int_rate + sub_grade + emp_length + annual_inc + purpose + dti + inq_last_6mths + pub_rec + revol_util + pub_rec_bankruptcies + state, data=loan.train.Final, family=binomial(logit))
+# Anova(model3)
+
+```
+
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+# Exhibit 6 (Model 4: Logistic Regression + Interactions)
+model4 <- glm(loan_status ~ sub_grade + emp_length * annual_inc + purpose + dti + term + inq_last_6mths + pub_rec + int_rate * revol_util + state + earliest.cr.line.year, data=loan.train.Final, family=binomial(logit))
+# Anova(model4)
+```
+
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+#Exhibit 7 (Model 5: Relaxed Best GLM)
+
+model5 <- glm(loan_status ~ term + int_rate + home_ownership + annual_inc + dti + inq_last_6mths + pub_rec + revol_util, data=loan.train.Final, family=binomial(logit))
+# Anova(model5)
+
+```
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+#Exhibit 8 (Model 6: Relaxed Best GLM, down to 0.05 significance level. Parsimonious model)
+model6 <- glm(loan_status ~ term + int_rate + annual_inc + inq_last_6mths + pub_rec + revol_util, data=loan.train.Final, family=binomial(logit))
+# Anova(model6)
+
+```
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+#Exhibit 9 (Model 7: Random Forest)
+set.seed(10)
+model.rf.7.2 <- randomForest(loan_status ~ . , loan.train.Final.tree, mtry=4, ntree=250)
+#plot(model.rf.7.2)
+
+```
+
+## Model Evaluation
+
+With seven models in hand, we will now apply these classifiers to the testing data and evaluate the classifiers using a method that maximizes the return per the estimate for a sensible loss ratio for picking up a bad loan. In this case, we will evaluate each of the classifiers using testing misclassification error, which will be chosen to maximize the return for a two-to-one loss ratio of picking up a bad loan to that of missing a good loan. 
+
+For illustrative purposes, we will also provide a comparison of the ROC curves for each of our classifiers built. 
+
+Since the loss ratio of picking up a bad loan to that of missing a good loan is 2:1, that means that false positives are twice as costly as false negatives. Given our notation for false positive, $a_{0,1}=L(Y=0, \hat Y=1)$, and false negative, $a_{1,0}=L(Y=1, \hat Y=0)$, then a risk ratio of $a_{0,1}=2a_{1,0}$ implies that the optimal rule for classifying a good loan (i.e. denoted "1" or "fully paid" is 
+
+$$\hat P(Y=1 \vert x) > \frac{2}{(1+2)}=0.67$$
+
+```{r, eval = TRUE, echo = FALSE, include = FALSE}
+model1.predict.test <- predict(model1, loan.test.Final,type="response")
+
+model2.predict.test <- predict(model2, loan.test.Final,type="response")
+
+model3.predict.test <- predict(model3, loan.test.Final,type="response")
+
+model4.predict.test <- predict(model4, loan.test.Final,type="response")
+
+model5.predict.test <- predict(model5, loan.test.Final,type="response")
+
+model6.predict.test <- predict(model6, loan.test.Final,type="response")
+
+model7.predict.test <- predict(model.rf.7.2, loan.test.Final.tree, type="prob")[,2]
+
+
+model1.roc.test <- roc(loan.test.F$loan_status, model1.predict.test, plot=T, col="blue")
+model2.roc.test <- roc(loan.test.F$loan_status, model2.predict.test, plot=T, col="green")
+model3.roc.test <- roc(loan.test.F$loan_status, model3.predict.test, plot=T, col="red")
+model4.roc.test <- roc(loan.test.F$loan_status, model4.predict.test, plot=T, col="orange")
+model5.roc.test <- roc(loan.test.F$loan_status, model5.predict.test, plot=T, col="yellow")
+model6.roc.test <- roc(loan.test.F$loan_status, model6.predict.test, plot=T, col="brown")
+model7.roc.test <- roc(loan.test.F$loan_status, model7.predict.test, plot=T, col="purple")
+
+```
+
+Below is a summary of the ROC curves for each of the 10 model fits, along with a summary output for testing AUC. However, misclassification error remains our key criterion for selecting a model.
+
+```{r, results=TRUE, echo=FALSE}
+
+plot(1-model1.roc.test$specificities, model1.roc.test$sensitivities, col="blue", lwd=3, type="l",
+     xlab="False Positive", 
+     ylab="Sensitivity")
+lines(1-model2.roc.test$specificities, model2.roc.test$sensitivities, col="green", lwd=3)
+lines(1-model3.roc.test$specificities, model3.roc.test$sensitivities, col="red", lwd=3)
+lines(1-model4.roc.test$specificities, model4.roc.test$sensitivities, col="orange", lwd=3)
+lines(1-model5.roc.test$specificities, model5.roc.test$sensitivities, col="yellow", lwd=3)
+lines(1-model6.roc.test$specificities, model6.roc.test$sensitivities, col="brown", lwd=3)
+lines(1-model7.roc.test$specificities, model7.roc.test$sensitivities, col="purple", lwd=3)
+legend("bottomright",
+       c(paste0("fit1 AUC=", round(model1.roc.test$auc,4)),
+         paste0("fit2 AUC=", round(model2.roc.test$auc,4)),
+         paste0("fit3 AUC=", round(model3.roc.test$auc,4)),
+         paste0("fit4 AUC=", round(model4.roc.test$auc,4)),
+         paste0("fit5 AUC=", round(model5.roc.test$auc,4)),
+         paste0("fit6 AUC=", round(model6.roc.test$auc,4)),
+         paste0("fit7 AUC=", round(model7.roc.test$auc,4))),
+         col=c("blue", "green", "red", "orange", "yellow", "brown", "purple"),
+         lty=1)
+
+```
+
+Finally, the data frame below shows the output for the testing MCE assuming a risk ratio of 1/2 for each of our 10 models. 
+
+```{r results=TRUE, echo=FALSE}
+
+model1.pred.bayes.test <- as.factor(ifelse(model1.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.1 <- (sum(model1.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model1.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+model2.pred.bayes.test <- as.factor(ifelse(model2.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.2 <- (sum(model2.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model2.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+model3.pred.bayes.test <- as.factor(ifelse(model3.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.3 <- (sum(model3.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model3.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+model4.pred.bayes.test <- as.factor(ifelse(model4.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.4 <- (sum(model4.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model4.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+model5.pred.bayes.test <- as.factor(ifelse(model5.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.5 <- (sum(model5.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model5.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+model6.pred.bayes.test <- as.factor(ifelse(model6.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.6 <- (sum(model6.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model6.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+model7.pred.bayes.test <- as.factor(ifelse(model7.predict.test > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.7 <- (sum(model7.pred.bayes.test[loan.test.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(model7.pred.bayes.test[loan.test.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.test.Final$loan_status)
+
+
+MCE_Bayes_Comps <- data.frame(MCE.bayes.1, MCE.bayes.2, MCE.bayes.3, MCE.bayes.4, MCE.bayes.5, MCE.bayes.6, MCE.bayes.7)
+names(MCE_Bayes_Comps) <- c("Model 1 MCE", "Model 2 MCE", "Model 3 MCE", "Model 4 MCE", "Model 5 MCE", "Model 6 MCE", "Model 7 MCE")
+MCE_Bayes_Comps
+
+```
+
+As we can see above, model 4 has the lowest testing overall weighted misclassification error assuming a risk ratio of 1/2. Therefore, based on testing MCE as the model selection criteria, we will choose model 4.
+
+# Model Selection and Conclusion
+
+## Model Selection
+
+The last step of our analysis is to validate our model using the validation data set in loan.validation.Final.
+
+```{r, echo=FALSE, results=TRUE}
+fit4.predict.test.validate <- predict(model4, loan.validation.Final,type="response")
+
+fit4.pred.bayes.test.validate <- as.factor(ifelse(fit4.predict.test.validate > .67, "Fully Paid", "Charged Off"))
+MCE.bayes.4.validate <- (sum(fit4.pred.bayes.test.validate[loan.validation.Final$loan_status == "Fully Paid"] != "Fully Paid")
+              + 2*sum(fit4.pred.bayes.test.validate[loan.validation.Final$loan_status == "Charged Off"] != "Charged Off"))/length(loan.validation.Final$loan_status)
+
+MCE.bayes.4.validate
+```
+
+The final misclassification rate is 0.283, based on validation data.
+
+```{r, echo=FALSE, results=TRUE}
+fit4.roc.test.validate <- roc(loan.validation.Final$loan_status, fit4.predict.test.validate)
+
+plot(1-fit4.roc.test.validate$specificities, fit4.roc.test.validate$sensitivities, col="blue", lwd=3, type="l",
+     xlab="False Positive", 
+     ylab="Sensitivity")
+legend("bottomright",
+       c(paste0("fit4 AUC=", round(fit4.roc.test.validate$auc,4))),
+         col=c("brown"),
+         lty=1)
+
+```
+
+The final validation AUC is 6893.
+
+## Conclusion
+
+Based on the final model chosen from the validation data set, we conclude that the model accounting for interactions should be the selected model for predicting loan status for the following reasons:
+
+* It has significantly superior predictive power, as measured by MCE, compared to the LASSO, elastic net and random forest models. 
+* It still maintains some interpretability so that we can draw insights into the risk factors that affect the status of a loan. 
+
+These insights could provide enormous value to Lending Club and potential investors as they assess new loans that apply on the online platform. For example, there are specific states and sub grades that tend to be positively associated with good borrowers. Using these insights, we could target sub-gradeG1 loans, which appear to have the best association with loans fully paid off while sub-gradeD3 has the worst association with loans fully paid off. Illinois is the best state to lend to while Washington is the worst, based on the data. Employment length of 5 years has the strongest association with fully paid off loans. If the purpose of the loan is for paying of a credit card bill or for a wedding, this has positive associations with paying off the loan. However, if the purpose is education, then these types of loans have the worst associations with fully paid off loans.  Finally, if the earlist credit line was 1996, then these types of loans have positive associations with the probability of fully paying off the loan.
+
+Despite the wide range of data mining techniques used in this analysis, if we had more time or more processing power, we would wish to improve upon the study by gathering more information existing assets of the borrower or the FICO score of the borrower. This information could have predictive power in determining whether a loan will be fully paid off or not.
+
+
+# Appendix
+
+* **Exhibit 1**
+
+```{r, results = TRUE, echo = FALSE}
+str(loan)
+```
+
+* **Exhibit 2**
+
+```{r results=TRUE, echo = FALSE}
+loan.s <- loan %>%
+  group_by(addr_state) %>%
+  summarise(
+    mean.loan.amnt=mean(loan_amnt, na.rm=TRUE), 
+    mean.total.pyment=mean(total_pymnt, na.rm=TRUE),
+    n=n())
+
+income.s <- loan.s[, c("addr_state", "mean.loan.amnt")]
+income.s$region <- tolower(state.name[match(income.s$addr_state, state.abb)])
+
+income.s$center_lat  <- state.center$x[match(income.s$addr_state, state.abb)]
+income.s$center_long <- state.center$y[match(income.s$addr_state, state.abb)]
+
+states <- map_data("state")
+map <- merge(states, income.s, sort=FALSE, by="region", all.x=TRUE)
+map <- map[order(map$order),]
+
+ggplot(map, aes(x=long, y=lat, group=group))+
+  geom_polygon(aes(fill=mean.loan.amnt))+
+  geom_path()+ 
+  geom_label(data=income.s, 
+             aes(x=center_lat, y=center_long, group=NA, label=addr_state), 
+             size=3, label.size = 0) +
+  scale_fill_distiller(palette = "YlGnBu", direction = 1)
+  # scale_fill_continuous(limits=c(min(map$mean.income), max(map$mean.income)),name="Mean Income",
+  #                       low="gold1", high="red4")
+## You can display all color palettes using the following
+# library(RColorBrewer)
+# display.brewer.all()
+
+```
+
+
+* **Exhibit 3**
+
+Logistic Regression: 
+```{r, results = TRUE, echo = FALSE}
+Anova(model1)
+# summary(model1)
+```
+
+* **Exhibit 4**
+
+Relaxed LASSO (lambda min): 
+```{r, results = TRUE, echo = FALSE}
+Anova(model2)
+# summary(model2)
+```
+
+* **Exhibit 5**
+
+Relaxed LASSO (lambda first): 
+```{r, results = TRUE, echo = FALSE}
+Anova(model3)
+# summary(model3)
+```
+
+* **Exhibit 6**
+
+Logistic Regression with Interactions
+```{r, results = TRUE, echo = FALSE}
+Anova(model4)
+# summary(model4)
+```
+
+* **Exhibit 7**
+
+Relaxed Best GLM
+```{r, results = TRUE, echo = FALSE}
+Anova(model5)
+# summary(model5)
+```
+
+* **Exhibit 8**
+
+Relaxed Best GLM. Significance Level 0.05 (Parsimonious Model)
+```{r, results = TRUE, echo = FALSE}
+Anova(model6)
+# summary(model6)
+```
+
+* **Exhibit 9**
+
+Random Forest
+```{r, results = TRUE, echo = FALSE}
+set.seed(10)
+model.rf.7.2 <- randomForest(loan_status ~ . , loan.train.Final.tree, mtry=4, ntree=250)
+plot(model.rf.7.2)
+```
+
