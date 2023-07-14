@@ -5,7 +5,7 @@ This repository shows the steps taken to perform an in-depth analysis of the "[L
 The data and the R Markdown Notebook have been added to the repo so that anyone can recreate the steps involved and add their own insights. 
 
 ## Use of:
-* **RStudio** version 3.9.7
+* **RStudio** 2023.03.0-daily+82.pro2
     * **Main Packages used:** ggplot2, dplyr, tidyr, bestglm, pROC, randomForest
 * [**R Markdown**](https://rmarkdown.rstudio.com/)
 
