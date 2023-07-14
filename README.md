@@ -20,14 +20,16 @@ The data and the R Markdown Notebook have been added to the repo so that anyone 
 * Final model chosen: **Relaxed LASSO model corresponding to lambda = lambda first** 
 * Model validation misclassifcation rate: **0.283**
 * Model validation AUC: **0.6893**
+![alt text](https://github.com/monacosc1/lending_club_analysis/blob/master/images/auc.png)
 
 ## Exploratory Data Analysis
-### Target Variable: Loan Status
-* Including Loan Status
+### Target Variable
+* Loan Status
 ![alt text](https://github.com/monacosc1/lending_club_analysis/blob/master/images/loan_status.png)
 
 ### Predictor Variables
-* Including Predictor Variables
+* Predictor Variables
+![alt text](https://github.com/monacosc1/lending_club_analysis/blob/master/images/predictor_variables.png)
 
 
 ## Main Steps
