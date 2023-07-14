@@ -24,6 +24,7 @@ The data and the R Markdown Notebook have been added to the repo so that anyone 
 ## Exploratory Data Analysis
 ### Target Variable: Loan Status
 * Including Loan Status
+![alt text](https://github.com/monacosc1/lending_club_analysis/blob/master/images/loan_status.png)
 
 ### Predictor Variables
 * Including Predictor Variables
